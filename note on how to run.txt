@@ -1,0 +1,20 @@
+run using ide similiar to spyder since it is what i used to  make it 
+## Required Libraries
+
+To run this code, you need the following libraries:
+
+1. `os` (Python Standard Library)
+2. `cv2` (OpenCV)
+3. `numpy`
+4. `tensorflow.keras`
+5. `dlib`
+6. `facenet_pytorch`
+7. `torch` (PyTorch)
+8. `tkinter` (Python Standard Library)
+9. `threading` (Python Standard Library)
+
+You can install the required libraries using the following commands:
+
+```bash
+pip install opencv-python-headless numpy tensorflow dlib facenet-pytorch torch
+```
