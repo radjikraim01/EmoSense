@@ -138,6 +138,22 @@ def nms(boxes, overlapThresh):
 
     return boxes[pick].astype("int")
 
+def _clamp_bbox(x1, y1, x2, y2, width, height):
+    x1 = max(0, min(int(x1), width - 1))
+    y1 = max(0, min(int(y1), height - 1))
+    x2 = max(0, min(int(x2), width))
+    y2 = max(0, min(int(y2), height))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+def _create_tracker():
+    if hasattr(cv2, "TrackerMIL_create"):
+        return cv2.TrackerMIL_create()
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMIL_create"):
+        return cv2.legacy.TrackerMIL_create()
+    raise RuntimeError("OpenCV TrackerMIL_create not available. Install opencv-contrib-python.")
+
 def process_video(video_path, output_path, start_time, end_time, progress_bar):
     cap = cv2.VideoCapture(video_path)
 
@@ -203,11 +219,20 @@ def process_video(video_path, output_path, start_time, end_time, progress_bar):
 
             verified_faces = []
             for (x1, y1, x2, y2) in nms_faces:
+                clamped = _clamp_bbox(x1, y1, x2, y2, frame_width, frame_height)
+                if not clamped:
+                    continue
+                x1, y1, x2, y2 = clamped
                 face_roi = frame[y1:y2, x1:x2]
+                if face_roi.size == 0:
+                    continue
                 if verify_face(face_roi):
-                    landmarks = shape_predictor(cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB), dlib.rectangle(0, 0, x2-x1, y2-y1))
+                    landmarks = shape_predictor(
+                        cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB),
+                        dlib.rectangle(0, 0, x2 - x1, y2 - y1),
+                    )
                     if landmarks:
-                        verified_faces.append((x1, y1, x2-x1, y2-y1))
+                        verified_faces.append((x1, y1, x2 - x1, y2 - y1))
             
             faces = verified_faces
             print(f"Detected {len(faces)} faces at frame {frame_count}")
@@ -222,7 +247,7 @@ def process_video(video_path, output_path, start_time, end_time, progress_bar):
                     new_face = False
                     break
             if new_face:
-                tracker = cv2.TrackerMIL_create()
+                tracker = _create_tracker()
                 tracker.init(frame, (x, y, w, h))
                 new_trackers.append({'tracker': tracker, 'bbox': (x, y, w, h), 'id': face_ids})
                 face_last_seen[face_ids] = frame_count
