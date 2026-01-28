@@ -231,13 +231,23 @@ class LiveEmotionDetectionApp:
         return self.non_max_suppression(np.array(faces), overlapThresh=0.3)
 
     def update_camera_feed(self, window_name, frame):
+        if not hasattr(cv2, "getWindowImageRect"):
+            cv2.imshow(window_name, frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.stop_event.set()
+            return
+
         # Get the current window size
-        window_size = cv2.getWindowImageRect(window_name)[2:]
+        window_width, window_height = cv2.getWindowImageRect(window_name)[2:]
+        if window_width <= 0 or window_height <= 0:
+            cv2.imshow(window_name, frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.stop_event.set()
+            return
 
         # Resize frame to fit the window while maintaining aspect ratio
         height, width, _ = frame.shape
         aspect_ratio = width / height
-        window_width, window_height = window_size
 
         if window_width / aspect_ratio <= window_height:
             new_width = window_width
