@@ -179,7 +179,6 @@ class LiveEmotionDetectionApp:
                 break
 
             faces = self.detect_faces(frame)
-            print(f"Detected faces: {faces}")
 
             for (x, y, x2, y2) in faces:
                 face = frame[y:y2, x:x2]
