@@ -8,6 +8,7 @@ import torch
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+import queue
 
 # Load pre-trained emotion detection model
 model = load_model('fer2013_custom_model.h5')
@@ -97,11 +98,25 @@ def start_detection():
     progress_bar.grid(row=1, column=0)
     progress_window.update_idletasks()
 
-    def process_video_thread():
-        process_video(video, output_path, start, end, progress_bar)
-        progress_window.destroy()
+    progress_queue = queue.Queue()
 
-    threading.Thread(target=process_video_thread).start()
+    def process_video_thread():
+        process_video(video, output_path, start, end, progress_queue)
+
+    def update_progress():
+        while not progress_queue.empty():
+            value = progress_queue.get()
+            if value is None:
+                progress_window.destroy()
+                return
+            if isinstance(value, tuple) and value[0] == "max":
+                progress_bar['maximum'] = value[1]
+                continue
+            progress_bar['value'] = value
+        progress_window.after(100, update_progress)
+
+    threading.Thread(target=process_video_thread, daemon=True).start()
+    update_progress()
 
 def nms(boxes, overlapThresh):
     if len(boxes) == 0:
@@ -154,153 +169,158 @@ def _create_tracker():
         return cv2.legacy.TrackerMIL_create()
     raise RuntimeError("OpenCV TrackerMIL_create not available. Install opencv-contrib-python.")
 
-def process_video(video_path, output_path, start_time, end_time, progress_bar):
+def process_video(video_path, output_path, start_time, end_time, progress_queue):
     cap = cv2.VideoCapture(video_path)
+    out = None
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_width = int(cap.get(3))
+        frame_height = int(cap.get(4))
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_width = int(cap.get(3))
-    frame_height = int(cap.get(4))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        start_frame = int(start_time * fps)
+        end_frame = int(end_time * fps)
 
-    start_frame = int(start_time * fps)
-    end_frame = int(end_time * fps)
+        overall_emotion_count = np.zeros(len(emotion_label), dtype=int)
+        overall_total_faces = 0
 
-    overall_emotion_count = np.zeros(len(emotion_label), dtype=int)
-    overall_total_faces = 0
+        trackers = []
+        face_ids = 0
+        known_faces = {}
+        face_last_seen = {}
 
-    trackers = []
-    face_ids = 0
-    known_faces = {}
-    face_last_seen = {}
+        detection_interval = 5
+        frame_count = 0
 
-    detection_interval = 5
-    frame_count = 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        progress_queue.put(("max", end_frame - start_frame))
 
-    progress_bar['maximum'] = end_frame - start_frame
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+            current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if current_frame > end_frame:
+                break
 
-        current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-        if current_frame > end_frame:
-            break
+            frame_count += 1
 
-        frame_count += 1
+            new_trackers = []
+            for tracker in trackers:
+                success, bbox = tracker['tracker'].update(frame)
+                if success:
+                    tracker['bbox'] = bbox
+                    new_trackers.append(tracker)
 
-        new_trackers = []
-        for tracker in trackers:
-            success, bbox = tracker['tracker'].update(frame)
-            if success:
-                tracker['bbox'] = bbox
-                new_trackers.append(tracker)
+            if frame_count % detection_interval == 0:
+                faces = []
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                detected_faces_dlib = detector(gray_frame)
+                detected_faces_haar = haar_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
 
-        if frame_count % detection_interval == 0:
-            faces = []
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            detected_faces_dlib = detector(gray_frame)
-            detected_faces_haar = haar_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                for face in detected_faces_dlib:
+                    x, y, w, h = face.left(), face.top(), face.width(), face.height()
+                    faces.append((x, y, x + w, y + h))
 
-            for face in detected_faces_dlib:
-                x, y, w, h = face.left(), face.top(), face.width(), face.height()
-                faces.append((x, y, x + w, y + h))
-            
-            for (x, y, w, h) in detected_faces_haar:
-                faces.append((x, y, x + w, y + h))
+                for (x, y, w, h) in detected_faces_haar:
+                    faces.append((x, y, x + w, y + h))
 
-            faces = np.array(faces)
-            nms_faces = nms(faces, 0.3)
+                faces = np.array(faces)
+                nms_faces = nms(faces, 0.3)
 
-            verified_faces = []
-            for (x1, y1, x2, y2) in nms_faces:
-                clamped = _clamp_bbox(x1, y1, x2, y2, frame_width, frame_height)
+                verified_faces = []
+                for (x1, y1, x2, y2) in nms_faces:
+                    clamped = _clamp_bbox(x1, y1, x2, y2, frame_width, frame_height)
+                    if not clamped:
+                        continue
+                    x1, y1, x2, y2 = clamped
+                    face_roi = frame[y1:y2, x1:x2]
+                    if face_roi.size == 0:
+                        continue
+                    if verify_face(face_roi):
+                        landmarks = shape_predictor(
+                            cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB),
+                            dlib.rectangle(0, 0, x2 - x1, y2 - y1),
+                        )
+                        if landmarks:
+                            verified_faces.append((x1, y1, x2 - x1, y2 - y1))
+
+                faces = verified_faces
+                print(f"Detected {len(faces)} faces at frame {frame_count}")
+            else:
+                faces = []
+
+            for (x, y, w, h) in faces:
+                new_face = True
+                for tracker in new_trackers:
+                    (tx, ty, tw, th) = [int(v) for v in tracker['bbox']]
+                    if (x > tx - 0.5 * w and y > ty - 0.5 * h and x + w < tx + 1.5 * tw and y + h < ty + 1.5 * th):
+                        new_face = False
+                        break
+                if new_face:
+                    tracker = _create_tracker()
+                    tracker.init(frame, (x, y, w, h))
+                    new_trackers.append({'tracker': tracker, 'bbox': (x, y, w, h), 'id': face_ids})
+                    face_last_seen[face_ids] = frame_count
+                    face_ids += 1
+
+            trackers = new_trackers
+
+            for tracker in trackers:
+                (x, y, w, h) = [int(v) for v in tracker['bbox']]
+                clamped = _clamp_bbox(x, y, x + w, y + h, frame_width, frame_height)
                 if not clamped:
                     continue
                 x1, y1, x2, y2 = clamped
                 face_roi = frame[y1:y2, x1:x2]
                 if face_roi.size == 0:
                     continue
-                if verify_face(face_roi):
-                    landmarks = shape_predictor(
-                        cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB),
-                        dlib.rectangle(0, 0, x2 - x1, y2 - y1),
-                    )
-                    if landmarks:
-                        verified_faces.append((x1, y1, x2 - x1, y2 - y1))
-            
-            faces = verified_faces
-            print(f"Detected {len(faces)} faces at frame {frame_count}")
-        else:
-            faces = []
 
-        for (x, y, w, h) in faces:
-            new_face = True
-            for tracker in new_trackers:
-                (tx, ty, tw, th) = [int(v) for v in tracker['bbox']]
-                if (x > tx - 0.5 * w and y > ty - 0.5 * h and x + w < tx + 1.5 * tw and y + h < ty + 1.5 * th):
-                    new_face = False
-                    break
-            if new_face:
-                tracker = _create_tracker()
-                tracker.init(frame, (x, y, w, h))
-                new_trackers.append({'tracker': tracker, 'bbox': (x, y, w, h), 'id': face_ids})
-                face_last_seen[face_ids] = frame_count
-                face_ids += 1
+                gray_face_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+                resized_face = cv2.resize(gray_face_roi, (48, 48))
+                resized_face = resized_face / 255.0
+                resized_face = np.expand_dims(resized_face, axis=-1)
 
-        trackers = new_trackers
+                predictions = model.predict(np.expand_dims(resized_face, axis=0))
+                dominant_emotion_index = np.argmax(predictions)
+                dominant_emotion = emotion_label[dominant_emotion_index]
 
-        for tracker in trackers:
-            (x, y, w, h) = [int(v) for v in tracker['bbox']]
-            face_roi = frame[y:y+h, x:x+w]
+                if tracker['id'] not in known_faces or (frame_count - face_last_seen[tracker['id']]) > detection_interval:
+                    known_faces[tracker['id']] = dominant_emotion_index
+                    face_last_seen[tracker['id']] = frame_count
 
-            gray_face_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-            resized_face = cv2.resize(gray_face_roi, (48, 48))
-            resized_face = resized_face / 255.0
-            resized_face = np.expand_dims(resized_face, axis=-1)
+                rect_color = (255, 0, 0)
+                for emotion, color in selected_emotions:
+                    if dominant_emotion == emotion:
+                        rect_color = color
+                        break
 
-            predictions = model.predict(np.expand_dims(resized_face, axis=0))
-            dominant_emotion_index = np.argmax(predictions)
-            dominant_emotion = emotion_label[dominant_emotion_index]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), rect_color, 2)
+                cv2.putText(frame, dominant_emotion, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rect_color, 2)
 
-            if tracker['id'] not in known_faces or (frame_count - face_last_seen[tracker['id']]) > detection_interval:
-                known_faces[tracker['id']] = dominant_emotion_index
-                face_last_seen[tracker['id']] = frame_count
+                overall_emotion_count[dominant_emotion_index] += 1
 
-            rect_color = (255, 0, 0)
-            for emotion, color in selected_emotions:
-                if dominant_emotion == emotion:
-                    rect_color = color
-                    break
+            overall_total_faces += len(faces)
 
-            cv2.rectangle(frame, (x, y), (x+w, y+h), rect_color, 2)
-            cv2.putText(frame, dominant_emotion, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rect_color, 2)
+            out.write(frame)
 
-            overall_emotion_count[dominant_emotion_index] += 1
+            progress_queue.put(current_frame - start_frame)
 
-        overall_total_faces += len(faces)
+        print("Overall Emotion Counts:")
+        for i, emotion in enumerate(emotion_label):
+            print(f'{emotion}: {overall_emotion_count[i]}')
 
-        emotion_percentages = (overall_emotion_count / overall_total_faces) * 100 if overall_total_faces > 0 else np.zeros(len(emotion_label), dtype=int)
-
-        out.write(frame)
-
-        progress_bar['value'] = current_frame - start_frame
-        root.update_idletasks()
-
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
-
-    print("Overall Emotion Counts:")
-    for i, emotion in enumerate(emotion_label):
-        print(f'{emotion}: {overall_emotion_count[i]}')
-
-    print(f'Total Unique Faces Detected: {len(known_faces)}')
+        print(f'Total Unique Faces Detected: {len(known_faces)}')
+    finally:
+        cap.release()
+        if out is not None:
+            out.release()
+        cv2.destroyAllWindows()
+        progress_queue.put(None)
 
 def verify_face(face_img):
     try:
